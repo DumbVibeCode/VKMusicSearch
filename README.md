@@ -17,7 +17,9 @@
 2. Установите зависимости:
 ```bash
 pip install -r requirements.txt
+```
 
 ## Запуск
 
 python vk_search.py
+
