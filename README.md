@@ -21,5 +21,8 @@ pip install -r requirements.txt
 
 ## Запуск
 
+```bash
 python vk_search.py
+```
 
+Откроется окно браузера, нужно залогиниться в ВК. Окно не закрывать!
