@@ -1734,13 +1734,24 @@ class VKMusicSearchApp:
         if self.btn_search:
             self.btn_search.config(state=tk.DISABLED)
 
+        # Проверяем, является ли запрос ссылкой на плейлист/альбом ВК
+        playlist_url = self._parse_vk_playlist_url(query)
+        if playlist_url:
+            self._set_search_status("Загружаю плейлист...")
+            threading.Thread(
+                target=self._load_playlist_worker,
+                args=(playlist_url, count),
+                daemon=True
+            ).start()
+            return
+
         # Проверяем, является ли запрос URL-ом профиля/группы ВК
         vk_profile = self._parse_vk_profile_url(query)
         if vk_profile:
             self._set_search_status(f"Загружаю музыку с {vk_profile}...")
             threading.Thread(
-                target=self._load_profile_music_worker, 
-                args=(vk_profile, count), 
+                target=self._load_profile_music_worker,
+                args=(vk_profile, count),
                 daemon=True
             ).start()
         else:
@@ -1776,6 +1787,51 @@ class VKMusicSearchApp:
                 return profile_id
         
         return None
+
+    def _parse_vk_playlist_url(self, text: str) -> str | None:
+        """
+        Определяет, является ли текст ссылкой на плейлист или альбом ВК.
+        Возвращает нормализованный URL или None.
+
+        Поддерживаемые форматы:
+          https://vk.com/music/playlist/-143097069_1_5956a0443443bf6ae2
+          https://vk.com/music/playlist/-143097069_1
+          https://vk.com/music/album/-143097069_1_5956a0443443bf6ae2
+          vk.com/music/playlist/12345_1
+        """
+        text = text.strip()
+        pattern = r'^(?:https?://)?(?:www\.)?vk\.com/(music/(?:playlist|album)/[-\w]+)(?:\?.*)?$'
+        match = re.match(pattern, text)
+        if match:
+            return f"https://vk.com/{match.group(1)}"
+        return None
+
+    def _load_playlist_worker(self, url: str, count: int):
+        """Загружает все треки из плейлиста или альбома ВК."""
+        try:
+            log_message(f"INFO: открываю плейлист: {url}")
+            self._set_search_status("Открываю плейлист...")
+            self.driver.get(url)
+
+            try:
+                WebDriverWait(self.driver, 15).until(
+                    EC.presence_of_element_located((By.CLASS_NAME, "audio_row"))
+                )
+            except Exception as e:
+                log_message(f"WARNING: audio_row не появились: {e}")
+                self._set_search_status("Треки не найдены или плейлист недоступен")
+                return
+
+            self._set_search_status("Загружаю треки...")
+            results = self._scroll_and_parse_audio(count)
+            self._update_results(results)
+
+        except Exception as e:
+            log_message(f"ERROR _load_playlist_worker: {e}")
+            self._set_search_status(f"Ошибка: {e}")
+        finally:
+            if self.btn_search:
+                self.search_window.after(0, lambda: self.btn_search.config(state=tk.NORMAL))
 
     def _load_profile_music_worker(self, profile_id: str, count: int):
         """
