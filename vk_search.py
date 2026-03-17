@@ -919,6 +919,7 @@ class VKMusicSearchApp:
 
             # Ищем элемент трека по audio_full_id
             audio_element = None
+            use_new_interface = False
 
             # Старый интерфейс: div.audio_row[data-full-id="..."]
             try:
@@ -926,13 +927,12 @@ class VKMusicSearchApp:
                     By.CSS_SELECTOR, f'div.audio_row[data-full-id="{audio_full_id}"]'
                 )
             except Exception:
-                pass
-
-            # Старый интерфейс: по data-audio атрибуту
-            if not audio_element:
-                for row in self.driver.find_elements(By.CSS_SELECTOR, 'div.audio_row'):
+                # Пробуем найти по data-audio атрибуту
+                rows = self.driver.find_elements(By.CSS_SELECTOR, 'div.audio_row')
+                for row in rows:
                     try:
-                        if audio_full_id in (row.get_attribute('data-audio') or ''):
+                        data_audio = row.get_attribute('data-audio')
+                        if data_audio and audio_full_id in data_audio:
                             audio_element = row
                             break
                     except Exception:
@@ -956,6 +956,7 @@ class VKMusicSearchApp:
                         new_rows = self.driver.find_elements(By.CSS_SELECTOR, '[data-testentitytag="audio"]')
                         if idx < len(new_rows):
                             audio_element = new_rows[idx]
+                            use_new_interface = True
                 except Exception:
                     pass
 
@@ -964,15 +965,22 @@ class VKMusicSearchApp:
                 return None
 
             # Кликаем на кнопку воспроизведения
-            try:
-                play_btn = audio_element.find_element(
-                    By.CSS_SELECTOR,
-                    '.audio_play_wrap, .audio_row__play_btn, .audio_row__cover,'
-                    '[data-testid="MusicTrackRow_PlaybackControls"]'
-                )
-                self.driver.execute_script("arguments[0].click();", play_btn)
-            except Exception:
-                self.driver.execute_script("arguments[0].click();", audio_element)
+            if use_new_interface:
+                try:
+                    play_btn = audio_element.find_element(
+                        By.CSS_SELECTOR, '[data-testid="MusicTrackRow_PlaybackControls"]'
+                    )
+                    self.driver.execute_script("arguments[0].click();", play_btn)
+                except Exception:
+                    self.driver.execute_script("arguments[0].click();", audio_element)
+            else:
+                try:
+                    play_btn = audio_element.find_element(
+                        By.CSS_SELECTOR, '.audio_play_wrap, .audio_row__play_btn, .audio_row__cover'
+                    )
+                    self.driver.execute_script("arguments[0].click();", play_btn)
+                except Exception:
+                    self.driver.execute_script("arguments[0].click();", audio_element)
 
             log_message("DOWNLOAD: кликнули на трек, ждём загрузки URL...")
 
