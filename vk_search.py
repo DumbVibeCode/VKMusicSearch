@@ -183,27 +183,52 @@ class VKMusicSearchApp:
         )
 
     def _is_logged_in(self) -> bool:
-        """Проверяем, что слева/сверху появилась шапка залогиненного ВК."""
+        """Проверяем, что пользователь залогинен в ВК."""
         if self.driver is None:
             return False
         try:
             time.sleep(0.5)
 
-            selectors = [
+            # Быстрая проверка по URL: на странице логина — точно не залогинены
+            url = self.driver.current_url or ""
+            if "/login" in url or "/join" in url or "id.vk.com" in url:
+                return False
+
+            # Надёжные data-testid атрибуты (актуальные на 2025–2026)
+            testid_selectors = [
+                "[data-testid='header-profile-menu']",
+                "[data-testid='header-profile-menu-button']",
+                "[data-testid='leftmenu']",
+                "[data-testid='header-notification-button']",
+            ]
+            for sel in testid_selectors:
+                if self.driver.find_elements(By.CSS_SELECTOR, sel):
+                    log_message(f"DEBUG: _is_logged_in: найден {sel}")
+                    return True
+
+            # Проверка через JavaScript (user ID в глобальных данных страницы)
+            try:
+                user_id = self.driver.execute_script(
+                    "try { return (window.vk && window.vk.id) || null } catch(e) { return null }"
+                )
+                if user_id:
+                    log_message(f"DEBUG: _is_logged_in: user_id={user_id}")
+                    return True
+            except Exception:
+                pass
+
+            # Старые селекторы как запасной вариант
+            legacy_selectors = [
                 "a#top_profile_link",
                 "a.top_profile_link",
                 "a.TopNavBtn__profileLink",
+                "div#side_bar",
+                "nav.left_menu_nav_wrap",
             ]
-            for sel in selectors:
-                elems = self.driver.find_elements(By.CSS_SELECTOR, sel)
-                if elems:
-                    log_message(f"DEBUG: _is_logged_in: найден элемент профиля по селектору {sel}")
+            for sel in legacy_selectors:
+                if self.driver.find_elements(By.CSS_SELECTOR, sel):
+                    log_message(f"DEBUG: _is_logged_in: найден (legacy) {sel}")
                     return True
-
-            side = self.driver.find_elements(By.CSS_SELECTOR, "div#side_bar, nav.left_menu_nav_wrap")
-            if side:
-                log_message("DEBUG: _is_logged_in: найден side_bar/left_menu_nav_wrap")
-                return True
 
         except Exception as e:
             log_message(f"WARNING: ошибка при проверке логина: {e}")
