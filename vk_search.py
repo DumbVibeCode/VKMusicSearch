@@ -918,34 +918,60 @@ class VKMusicSearchApp:
             self.driver.execute_cdp_cmd('Network.clearBrowserCache', {})
 
             # Ищем элемент трека по audio_full_id
-            # Формат: data-full-id="owner_id_audio_id" или class содержит audio_row
-            selector = f'div.audio_row[data-full-id="{audio_full_id}"]'
-            
+            audio_element = None
+
+            # Старый интерфейс: div.audio_row[data-full-id="..."]
             try:
-                audio_element = self.driver.find_element(By.CSS_SELECTOR, selector)
+                audio_element = self.driver.find_element(
+                    By.CSS_SELECTOR, f'div.audio_row[data-full-id="{audio_full_id}"]'
+                )
             except Exception:
-                # Пробуем найти по data-audio атрибуту
-                rows = self.driver.find_elements(By.CSS_SELECTOR, 'div.audio_row')
-                audio_element = None
-                for row in rows:
+                pass
+
+            # Старый интерфейс: по data-audio атрибуту
+            if not audio_element:
+                for row in self.driver.find_elements(By.CSS_SELECTOR, 'div.audio_row'):
                     try:
-                        data_audio = row.get_attribute('data-audio')
-                        if data_audio and audio_full_id in data_audio:
+                        if audio_full_id in (row.get_attribute('data-audio') or ''):
                             audio_element = row
                             break
                     except Exception:
                         continue
-                
-                if not audio_element:
-                    log_message(f"DOWNLOAD: не найден элемент трека {audio_full_id}")
-                    return None
+
+            # Новый интерфейс: [data-testentitytag="audio"] — ищем по индексу из JS Map
+            if not audio_element:
+                try:
+                    idx = self.driver.execute_script("""
+                        var target = arguments[0];
+                        var rows = document.querySelectorAll('[data-testentitytag="audio"]');
+                        if (!rows.length) return -1;
+                        var fk = Object.keys(rows[0]).find(function(k){ return k.startsWith('__reactFiber'); });
+                        if (!fk) return -1;
+                        var tp = rows[0][fk].memoizedProps.track.entity.trackProvider;
+                        var ids = [];
+                        tp.entities.data_.forEach(function(v, k){ ids.push(k); });
+                        return ids.indexOf(target);
+                    """, audio_full_id)
+                    if idx is not None and idx >= 0:
+                        new_rows = self.driver.find_elements(By.CSS_SELECTOR, '[data-testentitytag="audio"]')
+                        if idx < len(new_rows):
+                            audio_element = new_rows[idx]
+                except Exception:
+                    pass
+
+            if not audio_element:
+                log_message(f"DOWNLOAD: не найден элемент трека {audio_full_id}")
+                return None
 
             # Кликаем на кнопку воспроизведения
             try:
-                play_btn = audio_element.find_element(By.CSS_SELECTOR, '.audio_play_wrap, .audio_row__play_btn, .audio_row__cover')
+                play_btn = audio_element.find_element(
+                    By.CSS_SELECTOR,
+                    '.audio_play_wrap, .audio_row__play_btn, .audio_row__cover,'
+                    '[data-testid="MusicTrackRow_PlaybackControls"]'
+                )
                 self.driver.execute_script("arguments[0].click();", play_btn)
             except Exception:
-                # Кликаем на сам элемент
                 self.driver.execute_script("arguments[0].click();", audio_element)
 
             log_message("DOWNLOAD: кликнули на трек, ждём загрузки URL...")
@@ -1864,31 +1890,40 @@ class VKMusicSearchApp:
             if self.btn_search:
                 self.search_window.after(0, lambda: self.btn_search.config(state=tk.NORMAL))
 
-    # JS_EXTRACT_SCRIPT — извлекает треки из React props новых AudioRow-элементов
+    # Извлекает треки из нового интерфейса ВК:
+    # audio_full_id берём из MobX Map (shared trackProvider, ключи совпадают с порядком строк),
+    # title/artist/duration читаем из DOM через data-testid.
     _JS_EXTRACT_TRACKS = """
         var rows = document.querySelectorAll('[data-testentitytag="audio"]');
-        var seen = {};
+        if (rows.length === 0) return JSON.stringify([]);
+
+        // Получаем все audioId из shared trackProvider первой строки
+        var allAudioIds = [];
+        try {
+            var fk = Object.keys(rows[0]).find(function(k) { return k.startsWith('__reactFiber'); });
+            var tp = rows[0][fk].memoizedProps.track.entity.trackProvider;
+            tp.entities.data_.forEach(function(v, k) { allAudioIds.push(k); });
+        } catch(e) {}
+
         var results = [];
+        var seen = {};
         for (var i = 0; i < rows.length; i++) {
             try {
                 var row = rows[i];
-                var propsKey = Object.keys(row).find(function(k) {
-                    return k.startsWith('__reactProps');
-                });
-                if (!propsKey) continue;
-                var track = row[propsKey].track;
-                if (!track || !track.title) continue;
-                var fid = (track.owner_id || '') + '_' + (track.id || '');
-                if (seen[fid]) continue;
-                seen[fid] = true;
-                results.push({
-                    id:       String(track.id       || ''),
-                    owner_id: String(track.owner_id || ''),
-                    title:    String(track.title    || ''),
-                    artist:   String(track.artist   || ''),
-                    duration: Number(track.duration || 0),
-                    url:      String(track.url      || '')
-                });
+                var audioId = allAudioIds[i] || null;
+                if (!audioId || seen[audioId]) continue;
+                seen[audioId] = true;
+
+                var titleEl    = row.querySelector('[data-testid="MusicTrackRow_Title"]');
+                var artistEl   = row.querySelector('[data-testid="MusicTrackRow_Authors"]');
+                var durationEl = row.querySelector('[data-testid="MusicTrackRow_Duration"]');
+
+                var title    = titleEl    ? titleEl.innerText.trim()    : '';
+                var artist   = artistEl   ? artistEl.innerText.trim()   : '';
+                var duration = durationEl ? durationEl.innerText.trim() : '';
+
+                if (!title) continue;
+                results.push({ full_id: audioId, title: title, artist: artist, duration: duration });
             } catch(e) {}
         }
         return JSON.stringify(results);
@@ -1896,7 +1931,7 @@ class VKMusicSearchApp:
 
     def _extract_tracks_via_js(self) -> list[tuple]:
         """
-        Извлекает треки из React-props элементов [data-testentitytag="audio"].
+        Извлекает треки из нового интерфейса ВК через JS (React Fiber + MobX Map).
         Возвращает список кортежей в том же формате, что и _parse_search_results.
         """
         try:
@@ -1911,35 +1946,30 @@ class VKMusicSearchApp:
         results = []
         seen = set()
         for t in raw:
-            title    = t.get("title", "").strip()
-            artist   = t.get("artist", "").strip()
-            audio_id = t.get("id", "").strip()
-            owner_id = t.get("owner_id", "").strip()
-            duration = int(t.get("duration") or 0)
-            url      = t.get("url", "").strip()
+            full_id      = t.get("full_id", "").strip()
+            title        = t.get("title", "").strip()
+            artist       = t.get("artist", "").strip()
+            duration_str = t.get("duration", "").strip()
 
-            if not title or not audio_id:
+            if not title or not full_id:
                 continue
-            full_id = f"{owner_id}_{audio_id}"
             if full_id in seen:
                 continue
             seen.add(full_id)
 
-            minutes, secs = divmod(duration, 60)
-            duration_str = f"{minutes}:{secs:02d}"
-
+            # owner_display из full_id (формат: owner_id_audio_id)
             try:
-                oid = int(owner_id)
-                owner_display = f"club{abs(oid)}" if oid < 0 else (f"id{oid}" if oid else owner_id)
-            except ValueError:
-                owner_display = owner_id
+                oid = int(full_id.split("_")[0])
+                owner_display = f"club{abs(oid)}" if oid < 0 else (f"id{oid}" if oid else full_id)
+            except (ValueError, IndexError):
+                owner_display = full_id
 
             results.append((
                 (artist or "Неизвестный")[:80],
                 title[:120],
                 duration_str[:10],
                 owner_display[:32],
-                url,
+                "",        # url — получаем при скачивании через клик
                 full_id,
             ))
         return results
@@ -1950,6 +1980,7 @@ class VKMusicSearchApp:
         При необходимости падает обратно на BeautifulSoup (_scroll_and_parse_audio).
         """
         limit = count if count > 0 else None
+
 
         results = self._extract_tracks_via_js()
         log_message(f"INFO: JS-извлечение (первичное): {len(results)} треков")
