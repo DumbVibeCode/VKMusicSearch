@@ -1813,17 +1813,48 @@ class VKMusicSearchApp:
             self._set_search_status("Открываю плейлист...")
             self.driver.get(url)
 
-            try:
-                WebDriverWait(self.driver, 15).until(
-                    EC.presence_of_element_located((By.CLASS_NAME, "audio_row"))
-                )
-            except Exception as e:
-                log_message(f"WARNING: audio_row не появились: {e}")
-                self._set_search_status("Треки не найдены или плейлист недоступен")
-                return
+            # Ждём загрузки страницы — пробуем несколько возможных селекторов
+            audio_selectors = [
+                (By.CLASS_NAME, "audio_row"),
+                (By.CSS_SELECTOR, "[data-audio]"),
+                (By.CSS_SELECTOR, ".audio_pl_snippet__row"),
+                (By.CSS_SELECTOR, "[class*='AudioRow']"),
+                (By.CSS_SELECTOR, "[class*='audio_row']"),
+            ]
+            found = False
+            for by, sel in audio_selectors:
+                try:
+                    WebDriverWait(self.driver, 12).until(
+                        EC.presence_of_element_located((by, sel))
+                    )
+                    log_message(f"INFO: найден селектор аудио: {sel}")
+                    found = True
+                    break
+                except Exception:
+                    continue
+
+            if not found:
+                # Последняя попытка: просто ждём 5 сек и смотрим что есть
+                time.sleep(5)
+                src = self.driver.page_source
+                # Логируем уникальные классы элементов с data-audio
+                try:
+                    soup_dbg = BeautifulSoup(src, "html.parser")
+                    has_data_audio = soup_dbg.find_all(attrs={"data-audio": True})
+                    log_message(f"DEBUG playlist: data-audio элементов = {len(has_data_audio)}")
+                    audio_rows = soup_dbg.find_all("div", class_=lambda c: c and "audio" in c.lower())
+                    sample_classes = list({" ".join(el.get("class", [])) for el in audio_rows[:10]})
+                    log_message(f"DEBUG playlist: div с 'audio' в классе: {sample_classes[:5]}")
+                except Exception as dbg_e:
+                    log_message(f"DEBUG playlist parse error: {dbg_e}")
+
+                results = self._parse_search_results(self.driver.page_source, count or None)
+                if not results:
+                    self._set_search_status("Треки не найдены. Возможно, плейлист приватный или страница не загрузилась.")
+                    return
 
             self._set_search_status("Загружаю треки...")
-            results = self._scroll_and_parse_audio(count)
+            results = self._scroll_and_extract_playlist(count)
             self._update_results(results)
 
         except Exception as e:
@@ -1832,6 +1863,141 @@ class VKMusicSearchApp:
         finally:
             if self.btn_search:
                 self.search_window.after(0, lambda: self.btn_search.config(state=tk.NORMAL))
+
+    # JS_EXTRACT_SCRIPT — извлекает треки из React props новых AudioRow-элементов
+    _JS_EXTRACT_TRACKS = """
+        var rows = document.querySelectorAll('[data-testentitytag="audio"]');
+        var seen = {};
+        var results = [];
+        for (var i = 0; i < rows.length; i++) {
+            try {
+                var row = rows[i];
+                var propsKey = Object.keys(row).find(function(k) {
+                    return k.startsWith('__reactProps');
+                });
+                if (!propsKey) continue;
+                var track = row[propsKey].track;
+                if (!track || !track.title) continue;
+                var fid = (track.owner_id || '') + '_' + (track.id || '');
+                if (seen[fid]) continue;
+                seen[fid] = true;
+                results.push({
+                    id:       String(track.id       || ''),
+                    owner_id: String(track.owner_id || ''),
+                    title:    String(track.title    || ''),
+                    artist:   String(track.artist   || ''),
+                    duration: Number(track.duration || 0),
+                    url:      String(track.url      || '')
+                });
+            } catch(e) {}
+        }
+        return JSON.stringify(results);
+    """
+
+    def _extract_tracks_via_js(self) -> list[tuple]:
+        """
+        Извлекает треки из React-props элементов [data-testentitytag="audio"].
+        Возвращает список кортежей в том же формате, что и _parse_search_results.
+        """
+        try:
+            raw_json = self.driver.execute_script(self._JS_EXTRACT_TRACKS)
+            if not raw_json:
+                return []
+            raw = json.loads(raw_json)
+        except Exception as e:
+            log_message(f"ERROR _extract_tracks_via_js: {e}")
+            return []
+
+        results = []
+        seen = set()
+        for t in raw:
+            title    = t.get("title", "").strip()
+            artist   = t.get("artist", "").strip()
+            audio_id = t.get("id", "").strip()
+            owner_id = t.get("owner_id", "").strip()
+            duration = int(t.get("duration") or 0)
+            url      = t.get("url", "").strip()
+
+            if not title or not audio_id:
+                continue
+            full_id = f"{owner_id}_{audio_id}"
+            if full_id in seen:
+                continue
+            seen.add(full_id)
+
+            minutes, secs = divmod(duration, 60)
+            duration_str = f"{minutes}:{secs:02d}"
+
+            try:
+                oid = int(owner_id)
+                owner_display = f"club{abs(oid)}" if oid < 0 else (f"id{oid}" if oid else owner_id)
+            except ValueError:
+                owner_display = owner_id
+
+            results.append((
+                (artist or "Неизвестный")[:80],
+                title[:120],
+                duration_str[:10],
+                owner_display[:32],
+                url,
+                full_id,
+            ))
+        return results
+
+    def _scroll_and_extract_playlist(self, count: int) -> list[tuple]:
+        """
+        Скроллит страницу плейлиста и извлекает треки через JS (новый интерфейс ВК).
+        При необходимости падает обратно на BeautifulSoup (_scroll_and_parse_audio).
+        """
+        limit = count if count > 0 else None
+
+        results = self._extract_tracks_via_js()
+        log_message(f"INFO: JS-извлечение (первичное): {len(results)} треков")
+
+        # Если JS не дал ничего — значит старый интерфейс, используем BeautifulSoup
+        if not results:
+            log_message("INFO: JS-извлечение пустое, пробую _scroll_and_parse_audio")
+            return self._scroll_and_parse_audio(count)
+
+        if limit and len(results) >= limit:
+            return results[:limit]
+
+        # Скроллим для подгрузки следующих треков
+        scroll_pause = 1.5
+        max_scrolls = 30
+        try:
+            last_height = self.driver.execute_script("return document.body.scrollHeight")
+        except Exception:
+            last_height = None
+
+        for i in range(max_scrolls):
+            self._set_search_status(
+                f"Загружаю треки... ({len(results)}/{limit if limit else '∞'})"
+            )
+            try:
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            except Exception:
+                break
+            time.sleep(scroll_pause)
+
+            results = self._extract_tracks_via_js()
+            log_message(f"INFO: JS-извлечение после скролла #{i + 1}: {len(results)} треков")
+
+            if limit and len(results) >= limit:
+                break
+
+            try:
+                new_height = self.driver.execute_script("return document.body.scrollHeight")
+            except Exception:
+                break
+            if last_height is not None and new_height == last_height:
+                log_message("INFO: страница больше не растёт, прекращаю скролл")
+                break
+            last_height = new_height
+
+        if limit:
+            results = results[:limit]
+        return results
 
     def _load_profile_music_worker(self, profile_id: str, count: int):
         """
