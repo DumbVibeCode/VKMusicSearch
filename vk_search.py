@@ -1,9 +1,17 @@
 # VKSearch 0.1.1
 # © DumbVibeCode 14.12.2025
-# 
+#
 
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+import sys
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
+    QGroupBox, QProgressBar, QMenu, QAction, QMessageBox, QFileDialog,
+    QAbstractItemView, QHeaderView, QSizePolicy
+)
+from PyQt5.QtCore import Qt, pyqtSignal, QObject
+from PyQt5.QtGui import QFont, QKeySequence
+from PyQt5.QtWidgets import QShortcut
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
@@ -72,7 +80,20 @@ _app_instance = None
 _standalone_mode = False
 
 
-class VKMusicSearchApp:
+# ------------------------------------------------------
+# Вспомогательный класс окна поиска
+# ------------------------------------------------------
+class _SearchWindow(QWidget):
+    def __init__(self, on_close):
+        super().__init__()
+        self._on_close = on_close
+
+    def closeEvent(self, event):
+        self._on_close()
+        event.ignore()
+
+
+class VKMusicSearchApp(QObject):
     """
     - открывает vk.com в Selenium-браузере;
     - ждёт логина;
@@ -80,33 +101,35 @@ class VKMusicSearchApp:
     - по ПКМ по треку можно копировать и скачивать.
     """
 
-    def __init__(self, root: tk.Tk | tk.Toplevel, auto_open_browser: bool = True):
-        self.root = root
+    _call_in_main = pyqtSignal(object)
+
+    def __init__(self, parent=None, auto_open_browser: bool = True):
+        super().__init__()
+        self._call_in_main.connect(lambda fn: fn())
+
         self.driver = None
 
-        self.search_window: tk.Toplevel | None = None
-        self.query_var: tk.StringVar | None = None
-        self.count_var: tk.StringVar | None = None
-        self.search_status_var: tk.StringVar | None = None
-        self.progress_var: tk.DoubleVar | None = None
-        self.progress_bar: ttk.Progressbar | None = None
-        self.speed_var: tk.StringVar | None = None
-        self.speed_label: ttk.Label | None = None
-        self.batch_progress_var: tk.StringVar | None = None
-        self.batch_progress_label: ttk.Label | None = None
-        self.tree: ttk.Treeview | None = None
-        self.btn_search: ttk.Button | None = None
-        self.btn_download: ttk.Button | None = None
-        
+        self.search_window: _SearchWindow | None = None
+        self.query_edit: QLineEdit | None = None
+        self.count_edit: QLineEdit | None = None
+        self.search_status_label: QLabel | None = None
+        self.progress_bar: QProgressBar | None = None
+        self.speed_label: QLabel | None = None
+        self.batch_progress_label: QLabel | None = None
+        self.tree: QTableWidget | None = None
+        self.btn_search: QPushButton | None = None
+        self.btn_download: QPushButton | None = None
+
         # Для отслеживания скорости скачивания
         self._download_start_time: float = 0
         self._download_bytes: int = 0
         self._batch_download_mode: bool = False  # Флаг пакетного скачивания
 
-        self._tree_sort_reverse: dict[str, bool] = {}
+        self._tree_sort_reverse: dict[int, bool] = {}
 
         if not SELENIUM_AVAILABLE:
-            messagebox.showerror(
+            QMessageBox.critical(
+                None,
                 "Ошибка",
                 "Не найдены модули Selenium / webdriver-manager / bs4.\n\n"
                 "Установи:\n"
@@ -134,7 +157,7 @@ class VKMusicSearchApp:
                     "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
                 )
-                
+
                 # Включаем performance logging для перехвата сетевых запросов
                 options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
 
@@ -170,13 +193,13 @@ class VKMusicSearchApp:
         while waited < max_wait_sec:
             if self._is_logged_in():
                 log_message("INFO: ВК-вход обнаружен, открываю окно поиска")
-                self.root.after(0, self._show_search_window)
+                self._call_in_main.emit(self._show_search_window)
                 return
             time.sleep(interval)
             waited += interval
 
         log_message("WARNING: не удалось автоматически определить логин в ВК за отведённое время")
-        self.root.after(0, self._show_search_window)
+        self._call_in_main.emit(self._show_search_window)
         self._show_info_async(
             "Не удалось автоматически определить вход в ВК.\n"
             "Убедись, что ты залогинен в открытом окне браузера."
@@ -241,141 +264,125 @@ class VKMusicSearchApp:
     def _show_search_window(self):
         if self.search_window is not None:
             try:
-                self.search_window.lift()
-                self.search_window.focus_force()
+                self.search_window.raise_()
+                self.search_window.activateWindow()
                 return
             except Exception:
                 self.search_window = None
 
-        self.search_window = tk.Toplevel(self.root)
-        self.search_window.title("Поиск музыки ВК")
-        self.search_window.geometry("900x500")
-        self.search_window.resizable(True, True)
-        self.search_window.minsize(700, 400)
-        self.search_window.protocol("WM_DELETE_WINDOW", self._on_search_close)
+        self.search_window = _SearchWindow(self._on_search_close)
+        self.search_window.setWindowTitle("Поиск музыки ВК")
+        self.search_window.resize(900, 500)
+        self.search_window.setMinimumSize(700, 400)
 
-        self.search_window.lift()
-        self.search_window.focus_force()
+        main_layout = QVBoxLayout(self.search_window)
+        main_layout.setContentsMargins(10, 10, 10, 10)
 
-        main_frame = ttk.Frame(self.search_window, padding=10)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        # Заголовок
+        title_label = QLabel("🎵 Поиск музыки ВКонтакте (через браузер)")
+        title_font = QFont("Arial", 14)
+        title_font.setBold(True)
+        title_label.setFont(title_font)
+        main_layout.addWidget(title_label)
 
-        title_label = ttk.Label(
-            main_frame,
-            text="🎵 Поиск музыки ВКонтакте (через браузер)",
-            font=("Arial", 14, "bold")
-        )
-        title_label.pack(pady=(0, 10), anchor="w")
+        # ---- Параметры поиска ----
+        search_group = QGroupBox("Параметры поиска")
+        search_hlayout = QHBoxLayout(search_group)
 
-        # ---- верхняя панель ----
-        search_frame = ttk.LabelFrame(main_frame, text="Параметры поиска", padding=8)
-        search_frame.pack(fill=tk.X)
+        search_hlayout.addWidget(QLabel("Запрос:"))
 
-        ttk.Label(search_frame, text="Запрос:").grid(row=0, column=0, sticky="w")
+        self.query_edit = QLineEdit()
+        self.query_edit.returnPressed.connect(self._start_search)
+        self._add_entry_context_menu(self.query_edit)
+        search_hlayout.addWidget(self.query_edit, stretch=1)
 
-        self.query_var = tk.StringVar()
-        entry_query = ttk.Entry(search_frame, textvariable=self.query_var)
-        entry_query.grid(row=0, column=1, sticky="we", padx=5)
-        entry_query.bind("<Return>", lambda e: self._start_search())
-        self._add_entry_context_menu(entry_query)
+        search_hlayout.addWidget(QLabel("Кол-во треков:"))
 
-        ttk.Label(search_frame, text="Кол-во треков:").grid(
-            row=0, column=2, padx=(10, 0), sticky="e"
-        )
-        self.count_var = tk.StringVar(value="30")
-        entry_count = ttk.Entry(search_frame, textvariable=self.count_var, width=6)
-        entry_count.grid(row=0, column=3, sticky="w")
+        self.count_edit = QLineEdit("30")
+        self.count_edit.setFixedWidth(60)
+        search_hlayout.addWidget(self.count_edit)
 
-        self.btn_search = ttk.Button(search_frame, text="Искать", command=self._start_search)
-        self.btn_search.grid(row=0, column=4, padx=5)
-        
-        self.btn_download = ttk.Button(
-            search_frame, 
-            text="⬇ Скачать выбранные", 
-            command=self._download_selected_tracks
-        )
-        self.btn_download.grid(row=0, column=5, padx=5)
+        self.btn_search = QPushButton("Искать")
+        self.btn_search.clicked.connect(self._start_search)
+        search_hlayout.addWidget(self.btn_search)
 
-        search_frame.columnconfigure(1, weight=1)
+        self.btn_download = QPushButton("⬇ Скачать выбранные")
+        self.btn_download.clicked.connect(self._download_selected_tracks)
+        search_hlayout.addWidget(self.btn_download)
 
-        # ---- статус и прогресс-бар ----
-        status_frame = ttk.Frame(main_frame)
-        status_frame.pack(fill=tk.X, pady=(5, 0))
-        
-        self.search_status_var = tk.StringVar(value="Готово")
-        status_label = ttk.Label(
-            status_frame,
-            textvariable=self.search_status_var,
-            foreground="green"
-        )
-        status_label.pack(side=tk.LEFT)
-        
-        # Прогресс-бар (скрыт по умолчанию)
-        self.progress_var = tk.DoubleVar(value=0)
-        self.progress_bar = ttk.Progressbar(
-            status_frame,
-            variable=self.progress_var,
-            maximum=100,
-            length=250,
-            mode='determinate'
-        )
-        
-        # Скорость скачивания
-        self.speed_var = tk.StringVar(value="")
-        self.speed_label = ttk.Label(
-            status_frame,
-            textvariable=self.speed_var,
-            foreground="blue",
-            font=("Arial", 9)
-        )
-        
-        # Метка для общего прогресса (X/Y треков)
-        self.batch_progress_var = tk.StringVar(value="")
-        self.batch_progress_label = ttk.Label(
-            status_frame,
-            textvariable=self.batch_progress_var,
-            foreground="purple",
-            font=("Arial", 9, "bold")
+        main_layout.addWidget(search_group)
+
+        # ---- Статус и прогресс-бар ----
+        status_widget = QWidget()
+        status_hlayout = QHBoxLayout(status_widget)
+        status_hlayout.setContentsMargins(0, 0, 0, 0)
+
+        self.search_status_label = QLabel("Готово")
+        self.search_status_label.setStyleSheet("color: green;")
+        status_hlayout.addWidget(self.search_status_label)
+
+        # Растягивающийся разделитель
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        status_hlayout.addWidget(spacer)
+
+        self.batch_progress_label = QLabel("")
+        self.batch_progress_label.setStyleSheet("color: purple; font-weight: bold;")
+        self.batch_progress_label.hide()
+        status_hlayout.addWidget(self.batch_progress_label)
+
+        self.speed_label = QLabel("")
+        self.speed_label.setStyleSheet("color: blue; font-size: 9pt;")
+        self.speed_label.hide()
+        status_hlayout.addWidget(self.speed_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setFixedWidth(250)
+        self.progress_bar.hide()
+        status_hlayout.addWidget(self.progress_bar)
+
+        main_layout.addWidget(status_widget)
+
+        # ---- Результаты поиска ----
+        results_group = QGroupBox("Результаты поиска")
+        results_vlayout = QVBoxLayout(results_group)
+
+        self.tree = QTableWidget()
+        self.tree.setColumnCount(6)
+        self.tree.setHorizontalHeaderLabels(
+            ["Исполнитель", "Название", "Длительность", "Владелец", "", ""]
         )
 
-        # ---- таблица ----
-        results_frame = ttk.LabelFrame(main_frame, text="Результаты поиска", padding=5)
-        results_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        header = self.tree.horizontalHeader()
+        header.resizeSection(0, 220)
+        header.resizeSection(1, 420)
+        header.resizeSection(2, 80)
+        header.resizeSection(3, 120)
+        header.resizeSection(4, 0)
+        header.resizeSection(5, 0)
+        header.setStretchLastSection(False)
 
-        # добавляем скрытые столбцы url и audio_full_id (для yt-dlp)
-        columns = ("artist", "title", "duration", "owner", "url", "audio_full_id")
-        self.tree = ttk.Treeview(
-            results_frame,
-            columns=columns,
-            displaycolumns=("artist", "title", "duration", "owner"),
-            show="headings",
-            height=15,
-            selectmode="extended"  # множественный выбор
-        )
+        # Скрываем столбцы url и audio_full_id
+        self.tree.setColumnHidden(4, True)
+        self.tree.setColumnHidden(5, True)
 
-        self.tree.heading("artist", text="Исполнитель")
-        self.tree.heading("title", text="Название")
-        self.tree.heading("duration", text="Длительность")
-        self.tree.heading("owner", text="Владелец")
-        self.tree.heading("url", text="")
-        self.tree.heading("audio_full_id", text="")
+        self.tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tree.verticalHeader().hide()
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
 
-        self.tree.column("artist", width=220, anchor="w")
-        self.tree.column("title", width=420, anchor="w")
-        self.tree.column("duration", width=80, anchor="center")
-        self.tree.column("owner", width=120, anchor="w")
-        self.tree.column("url", width=0, stretch=False, anchor="w")
-        self.tree.column("audio_full_id", width=0, stretch=False, anchor="w")
+        results_vlayout.addWidget(self.tree)
+        main_layout.addWidget(results_group, stretch=1)
 
-        vsb = ttk.Scrollbar(results_frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # сортировка + контекстное меню
+        # Сортировка + контекстное меню
         self._init_tree_sorting()
         self._add_tree_context_menu()
+
+        self.search_window.show()
+        self.search_window.raise_()
+        self.search_window.activateWindow()
 
     def _on_search_close(self):
         """Закрыть окно и убить браузер."""
@@ -387,97 +394,60 @@ class VKMusicSearchApp:
         self.driver = None
 
         if self.search_window is not None:
-            self.search_window.destroy()
+            self.search_window.close()
             self.search_window = None
 
         if _standalone_mode:
-            try:
-                self.root.quit()
-                self.root.destroy()
-            except Exception:
-                pass
+            QApplication.quit()
 
     # --------------------------------------------------
     # КОНТЕКСТНОЕ МЕНЮ ДЛЯ ENTRY
     # --------------------------------------------------
 
-    @staticmethod
-    def _entry_select_all(entry: tk.Entry | ttk.Entry):
-        entry.select_range(0, "end")
-        entry.icursor("end")
-
-    def _add_entry_context_menu(self, entry: ttk.Entry):
-        menu = tk.Menu(entry, tearoff=0)
-        menu.add_command(label="Вырезать", command=lambda: entry.event_generate("<<Cut>>"))
-        menu.add_command(label="Копировать", command=lambda: entry.event_generate("<<Copy>>"))
-        menu.add_command(label="Вставить", command=lambda: entry.event_generate("<<Paste>>"))
-        menu.add_separator()
-        menu.add_command(label="Выделить всё", command=lambda: self._entry_select_all(entry))
-
-        def show_menu(event):
-            menu.tk_popup(event.x_root, event.y_root)
-
-        entry.bind("<Button-3>", show_menu)
-        entry.bind("<Control-a>", lambda e: (self._entry_select_all(entry), "break"))
-
-        entry._popup_menu = menu  # чтобы не улетело
+    def _add_entry_context_menu(self, entry: QLineEdit):
+        entry.setContextMenuPolicy(Qt.CustomContextMenu)
+        entry.customContextMenuRequested.connect(
+            lambda pos: entry.createStandardContextMenu().exec_(entry.mapToGlobal(pos))
+        )
 
     # --------------------------------------------------
     # КОНТЕКСТНОЕ МЕНЮ ДЛЯ ТАБЛИЦЫ
     # --------------------------------------------------
 
     def _add_tree_context_menu(self):
-        if not self.tree:
-            return
+        self.tree.customContextMenuRequested.connect(self._show_tree_context_menu)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
 
-        menu = tk.Menu(self.tree, tearoff=0)
-        menu.add_command(
-            label="Копировать «Исполнитель – Название»",
-            command=self._copy_artist_title_from_row
-        )
-        menu.add_command(
-            label="Копировать ссылку на владельца",
-            command=self._copy_owner_link_from_row
-        )
-        menu.add_separator()
-        menu.add_command(
-            label="Скачать трек",
-            command=self._download_track_from_row
-        )
-        menu.add_command(
-            label="Скачать выбранные",
-            command=self._download_selected_tracks
-        )
-        menu.add_separator()
-        menu.add_command(
-            label="Выбрать все",
-            command=lambda: self.tree.selection_set(self.tree.get_children())
-        )
+        QShortcut(QKeySequence("Ctrl+A"), self.tree, lambda: self.tree.selectAll())
+        QShortcut(QKeySequence("Ctrl+D"), self.tree, self._download_selected_tracks)
+        QShortcut(QKeySequence("Return"), self.tree, self._download_selected_tracks)
 
-        def show_menu(event):
-            iid = self.tree.identify_row(event.y)
-            if iid:
-                # Если кликнули на невыбранную строку - выбираем только её
-                # Если на выбранную - оставляем текущий выбор
-                if iid not in self.tree.selection():
-                    self.tree.selection_set(iid)
-                menu.tk_popup(event.x_root, event.y_root)
-
-        self.tree.bind("<Button-3>", show_menu)
-        self.tree._popup_menu = menu
-        
-        # Горячие клавиши
-        self.tree.bind("<Control-a>", lambda e: self.tree.selection_set(self.tree.get_children()))
-        self.tree.bind("<Control-d>", lambda e: self._download_selected_tracks())
-        self.tree.bind("<Return>", lambda e: self._download_selected_tracks())
+    def _show_tree_context_menu(self, pos):
+        idx = self.tree.indexAt(pos)
+        if idx.isValid():
+            if idx.row() not in [i.row() for i in self.tree.selectedIndexes()]:
+                self.tree.selectRow(idx.row())
+        menu = QMenu(self.tree)
+        menu.addAction("Копировать «Исполнитель – Название»", self._copy_artist_title_from_row)
+        menu.addAction("Копировать ссылку на владельца", self._copy_owner_link_from_row)
+        menu.addSeparator()
+        menu.addAction("Скачать трек", self._download_track_from_row)
+        menu.addAction("Скачать выбранные", self._download_selected_tracks)
+        menu.addSeparator()
+        menu.addAction("Выбрать все", self.tree.selectAll)
+        menu.exec_(self.tree.viewport().mapToGlobal(pos))
 
     def _get_selected_row_values(self):
         if not self.tree:
             return None
-        sel = self.tree.selection()
-        if not sel:
+        rows = list(set(item.row() for item in self.tree.selectedItems()))
+        if not rows:
             return None
-        return self.tree.item(sel[0], "values")
+        row = rows[0]
+        return tuple(
+            self.tree.item(row, col).text() if self.tree.item(row, col) else ""
+            for col in range(6)
+        )
 
     def _copy_artist_title_from_row(self):
         vals = self._get_selected_row_values()
@@ -487,10 +457,8 @@ class VKMusicSearchApp:
         title = vals[1]
         text = f"{artist} - {title}" if title else artist
 
-        w = self.search_window or self.root
         try:
-            w.clipboard_clear()
-            w.clipboard_append(text)
+            QApplication.clipboard().setText(text)
             self._set_search_status("Исполнитель и название скопированы")
         except Exception as e:
             log_message(f"WARNING: не удалось скопировать трек в буфер: {e}")
@@ -528,10 +496,8 @@ class VKMusicSearchApp:
             self._set_search_status("Не удалось построить ссылку на владельца")
             return
 
-        w = self.search_window or self.root
         try:
-            w.clipboard_clear()
-            w.clipboard_append(url)
+            QApplication.clipboard().setText(url)
             self._set_search_status("Ссылка на владельца скопирована")
         except Exception as e:
             log_message(f"WARNING: не удалось скопировать ссылку владельца: {e}")
@@ -569,12 +535,11 @@ class VKMusicSearchApp:
 
         default_filename = safe_name + ".mp3"
 
-        path = filedialog.asksaveasfilename(
-            parent=self.search_window,
-            title="Сохранить трек как...",
-            defaultextension=".mp3",
-            initialfile=default_filename,
-            filetypes=[("Аудио MP3", "*.mp3"), ("Все файлы", "*.*")]
+        path, _ = QFileDialog.getSaveFileName(
+            self.search_window,
+            "Сохранить трек как...",
+            default_filename,
+            "Аудио MP3 (*.mp3);;Все файлы (*)"
         )
         if not path:
             self._set_search_status("Сохранение отменено")
@@ -582,7 +547,7 @@ class VKMusicSearchApp:
 
         def worker():
             success = False
-            
+
             # Показываем прогресс-бар
             self._show_progress_bar()
             self._update_progress(0, "")
@@ -597,7 +562,7 @@ class VKMusicSearchApp:
 
             # Скрываем прогресс-бар
             self._hide_progress_bar()
-            
+
             if not success:
                 self._set_search_status("Не удалось скачать трек")
                 self._show_error_async(
@@ -618,14 +583,17 @@ class VKMusicSearchApp:
         """
         if not self.tree:
             return
-        selection = self.tree.selection()
-        if not selection:
+        rows = list(set(item.row() for item in self.tree.selectedItems()))
+        if not rows:
             self._set_search_status("Не выбрано ни одного трека")
             return
         # Собираем данные выбранных треков
         tracks = []
-        for iid in selection:
-            vals = self.tree.item(iid, "values")
+        for row in rows:
+            vals = tuple(
+                self.tree.item(row, col).text() if self.tree.item(row, col) else ""
+                for col in range(6)
+            )
             if vals and len(vals) >= 6:
                 artist = (vals[0] or "").strip()
                 title = (vals[1] or "").strip()
@@ -644,9 +612,9 @@ class VKMusicSearchApp:
             return
 
         # Запрашиваем папку для сохранения
-        folder = filedialog.askdirectory(
-            parent=self.search_window,
-            title=f"Выберите папку для сохранения ({len(tracks)} треков)"
+        folder = QFileDialog.getExistingDirectory(
+            self.search_window,
+            f"Выберите папку для сохранения ({len(tracks)} треков)"
         )
         if not folder:
             self._set_search_status("Сохранение отменено")
@@ -703,11 +671,13 @@ class VKMusicSearchApp:
                 eta_str = self._format_seconds(eta_seconds)
                 # --- КОНЕЦ НОВОГО ---
 
-                # --- НОВОЕ: Обновление прогресса напрямую ---
-                # Обновляем прогресс-бар напрямую через Tkinter thread-safe метод
-                self.search_window.after(0, lambda p=overall_percent, t=f"[{i}/{total}]", eta=eta_str: (
-                    setattr(self.progress_bar, 'value', p), # Обновление значения напрямую
-                    self.batch_progress_var.set(f"{t} ~{eta}") # Обновление метки с ETA
+                # --- НОВОЕ: Обновление прогресса ---
+                _p = overall_percent
+                _t = f"[{i}/{total}]"
+                _eta = eta_str
+                self._call_in_main.emit(lambda p=_p, t=_t, eta=_eta: (
+                    self.progress_bar.setValue(int(p)),
+                    self.batch_progress_label.setText(f"{t} ~{eta}")
                 ))
                 # --- КОНЕЦ НОВОГО ---
 
@@ -737,10 +707,11 @@ class VKMusicSearchApp:
 
             # Скрываем прогресс-бар и сбрасываем флаг
             self._batch_download_mode = False
-            # Обновляем до 100% и индикатор через Tkinter thread-safe метод
-            self.search_window.after(0, lambda t=f"[{total}/{total}]": (
-                setattr(self.progress_bar, 'value', 100), # Установка значения напрямую
-                self.batch_progress_var.set(t) # batch_progress_var всё ещё нужен для метки
+            # Обновляем до 100% и индикатор
+            _tt = f"[{total}/{total}]"
+            self._call_in_main.emit(lambda t=_tt: (
+                self.progress_bar.setValue(100),
+                self.batch_progress_label.setText(t)
             ))
             time.sleep(0.3)
             self._hide_progress_bar()
@@ -759,7 +730,7 @@ class VKMusicSearchApp:
 
             # --- НОВОЕ: Повторные попытки для неудачных ---
             if failed_tracks_list:
-                self.search_window.after(0, lambda: self._set_search_status(f"Завершено. {success_count} ок, {fail_count} не скачано. Повторные попытки..."))
+                self._call_in_main.emit(lambda: self._set_search_status(f"Завершено. {success_count} ок, {fail_count} не скачано. Повторные попытки..."))
                 log_message("DOWNLOAD BATCH: начинаю повторные попытки для неудачных треков...")
                 retry_success = 0
                 retry_fail = 0
@@ -823,12 +794,12 @@ class VKMusicSearchApp:
                             log_message(f"WARNING: не удалось удалить файл с неудачными треками: {e}")
                 # --- КОНЕЦ НОВОГО ---
 
-            # Итоговый статус через Tkinter thread-safe метод
+            # Итоговый статус
             if fail_count == 0:
-                self.search_window.after(0, lambda: self._set_search_status(f"✓ Скачано {success_count} треков"))
+                self._call_in_main.emit(lambda: self._set_search_status(f"✓ Скачано {success_count} треков"))
                 log_message(f"DOWNLOAD BATCH complete: {success_count} ok, {fail_count} failed (all retries done)")
             else:
-                self.search_window.after(0, lambda: self._set_search_status(f"Скачано {success_count}, не удалось: {fail_count}. См. failed_tracks.json"))
+                self._call_in_main.emit(lambda: self._set_search_status(f"Скачано {success_count}, не удалось: {fail_count}. См. failed_tracks.json"))
                 log_message(f"DOWNLOAD BATCH complete: {success_count} ok, {fail_count} failed. See {failed_file_path}")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -840,7 +811,7 @@ class VKMusicSearchApp:
         Скачивает аудио без обновления UI (для параллельного скачивания).
         """
         is_m3u8 = 'index.m3u8' in url or '.m3u8' in url
-        
+
         if is_m3u8:
             try:
                 output_path = path
@@ -857,7 +828,7 @@ class VKMusicSearchApp:
                     '--audio-quality', '0',
                     url
                 ]
-                
+
                 result = subprocess.run(
                     cmd,
                     capture_output=True,
@@ -865,9 +836,9 @@ class VKMusicSearchApp:
                     timeout=180,  # 3 минуты таймаут
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
                 )
-                
+
                 return result.returncode == 0
-                
+
             except subprocess.TimeoutExpired:
                 log_message(f"DOWNLOAD: таймаут для {path}")
                 return False
@@ -889,7 +860,7 @@ class VKMusicSearchApp:
 
             # Ищем элемент трека на странице и кликаем
             m3u8_url = self._get_audio_url_via_click(audio_full_id)
-            
+
             if not m3u8_url:
                 log_message("DOWNLOAD intercept: не удалось получить m3u8 URL")
                 return False
@@ -913,7 +884,7 @@ class VKMusicSearchApp:
         try:
             # Включаем перехват сетевых запросов через CDP
             self.driver.execute_cdp_cmd('Network.enable', {})
-            
+
             # Очищаем историю запросов
             self.driver.execute_cdp_cmd('Network.clearBrowserCache', {})
 
@@ -1206,9 +1177,9 @@ class VKMusicSearchApp:
 
     def _download_m3u8_via_ytdlp(self, url: str, path: str) -> bool:
         """Скачивает аудио URL через yt-dlp (subprocess) или requests."""
-        
+
         is_m3u8 = 'index.m3u8' in url or '.m3u8' in url
-        
+
         # Для m3u8 используем yt-dlp через subprocess (как в консоли)
         if is_m3u8:
             try:
@@ -1235,7 +1206,7 @@ class VKMusicSearchApp:
                     '--audio-quality', '0',  # лучшее качество
                     url
                 ]
-                
+
                 log_message(f"DOWNLOAD cmd: {' '.join(cmd[:6])}...")
 
                 # Запускаем процесс
@@ -1254,7 +1225,7 @@ class VKMusicSearchApp:
                         # Логируем всё кроме строк прогресса скачивания
                         if not ('[download]' in line and '%' in line):
                             log_message(f"yt-dlp: {line[:100]}")
-                            
+
                         if '[download]' in line and '%' in line:
                             # Парсим прогресс и скорость
                             # Форматы:
@@ -1265,7 +1236,7 @@ class VKMusicSearchApp:
                                 percent_match = line.split('%')[0]
                                 percent_str = percent_match.split()[-1]
                                 frag_percent = float(percent_str)
-                                
+
                                 # Проверяем есть ли информация о фрагментах
                                 # Формат: (frag X/Y)
                                 overall_percent = frag_percent
@@ -1281,7 +1252,7 @@ class VKMusicSearchApp:
                                         frag_info = f" (фраг. {frag_current}/{frag_total})"
                                     except:
                                         pass
-                                
+
                                 # Размер файла
                                 size = ""
                                 if ' of ' in line:
@@ -1291,47 +1262,47 @@ class VKMusicSearchApp:
                                     elif ' of ~ ' in line:
                                         size_part = line.split(' of ~ ')[1].split()[0]
                                         size = "~" + size_part
-                                
+
                                 # Скорость
                                 speed = ""
                                 if ' at ' in line:
                                     at_part = line.split(' at ')[1]
                                     speed = at_part.split()[0]
-                                
+
                                 # ETA
                                 eta = ""
                                 if 'ETA' in line:
                                     eta = line.split('ETA')[1].strip().split()[0]
-                                
+
                                 # Обновляем UI с общим прогрессом
                                 self._update_progress(overall_percent, f"{speed}" if speed else "")
-                                
+
                                 status = f"Скачиваю: {overall_percent:.1f}%"
                                 if size:
                                     status += f" из {size}"
                                 if eta and eta != "00:00":
                                     status += f" (осталось {eta})"
                                 self._set_search_status(status)
-                                
+
                             except Exception as e:
                                 log_message(f"Parse error: {e}")
-                                
+
                         elif '[download] 100%' in line or 'has already been downloaded' in line:
                             self._update_progress(100, "")
                             self._set_search_status("Загрузка завершена, конвертирую...")
-                            
+
                         elif 'Destination' in line:
                             self._set_search_status("Сохраняю...")
-                            
+
                         elif 'Post-process' in line or 'ffmpeg' in line.lower() or 'Converting' in line:
                             self._update_progress(100, "конвертация")
                             self._set_search_status("Конвертирую в MP3...")
-                            
+
                         elif 'Deleting original file' in line:
                             self._set_search_status("Завершаю...")
 
                 process.wait()
-                
+
                 if process.returncode == 0:
                     self._update_progress(100, "готово")
                     self._set_search_status("Скачивание завершено!")
@@ -1356,7 +1327,7 @@ class VKMusicSearchApp:
                     self._hide_progress_bar()
                 log_message(f"DOWNLOAD m3u8 subprocess failed: {e}")
                 return self._download_m3u8_manually(url, path)
-        
+
         # Для прямых ссылок качаем через requests
         else:
             try:
@@ -1384,10 +1355,10 @@ class VKMusicSearchApp:
                     "Origin": "https://vk.com",
                 }
 
-                with requests.get(url, headers=headers, cookies=cookies_dict, 
+                with requests.get(url, headers=headers, cookies=cookies_dict,
                                 stream=True, timeout=120) as r:
                     r.raise_for_status()
-                    
+
                     total_size = int(r.headers.get('content-length', 0))
                     downloaded = 0
                     start_time = time.time()
@@ -1398,18 +1369,18 @@ class VKMusicSearchApp:
                             if chunk:
                                 f.write(chunk)
                                 downloaded += len(chunk)
-                                
+
                                 current_time = time.time()
                                 # Обновляем UI не чаще чем раз в 0.2 секунды
                                 if current_time - last_update_time >= 0.2:
                                     last_update_time = current_time
-                                    
+
                                     # Вычисляем прогресс
                                     if total_size > 0:
                                         percent = downloaded * 100 / total_size
                                     else:
                                         percent = 0
-                                    
+
                                     # Вычисляем скорость
                                     elapsed = current_time - start_time
                                     if elapsed > 0:
@@ -1422,7 +1393,7 @@ class VKMusicSearchApp:
                                             speed_str = f"{speed_bps:.0f} B/s"
                                     else:
                                         speed_str = ""
-                                    
+
                                     # Вычисляем ETA
                                     eta_str = ""
                                     if total_size > 0 and speed_bps > 0:
@@ -1432,10 +1403,10 @@ class VKMusicSearchApp:
                                             eta_str = f"{int(eta_sec)}с"
                                         else:
                                             eta_str = f"{int(eta_sec // 60)}м {int(eta_sec % 60)}с"
-                                    
+
                                     # Обновляем UI
                                     self._update_progress(percent, speed_str)
-                                    
+
                                     # Форматируем размер
                                     if total_size > 0:
                                         if total_size >= 1024 * 1024:
@@ -1448,10 +1419,10 @@ class VKMusicSearchApp:
                                             status = f"Скачано: {downloaded / (1024*1024):.1f} MB"
                                         else:
                                             status = f"Скачано: {downloaded / 1024:.0f} KB"
-                                    
+
                                     if eta_str:
                                         status += f" ~{eta_str}"
-                                    
+
                                     self._set_search_status(status)
 
                 self._update_progress(100, "готово")
@@ -1538,14 +1509,14 @@ class VKMusicSearchApp:
             try:
                 import subprocess
                 mp3_path = path if path.lower().endswith('.mp3') else path.rsplit('.', 1)[0] + '.mp3'
-                
+
                 self._set_search_status("Конвертирую в MP3...")
                 result = subprocess.run(
                     ['ffmpeg', '-y', '-i', ts_path, '-acodec', 'libmp3lame', '-q:a', '0', mp3_path],
                     capture_output=True,
                     timeout=120
                 )
-                
+
                 if result.returncode == 0:
                     # Удаляем .ts файл
                     try:
@@ -1559,7 +1530,7 @@ class VKMusicSearchApp:
                     log_message(f"DOWNLOAD: ffmpeg error: {result.stderr.decode()[:200]}")
                     self._set_search_status(f"Сохранено как .ts (ffmpeg недоступен)")
                     return True  # Всё равно успех, файл есть
-                    
+
             except FileNotFoundError:
                 log_message("DOWNLOAD: ffmpeg не найден, оставляем .ts")
                 self._set_search_status(f"Сохранено как .ts (установи ffmpeg для MP3)")
@@ -1599,10 +1570,10 @@ class VKMusicSearchApp:
                 "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
             }
 
-            with requests.get(url, headers=headers, cookies=cookies_dict, 
+            with requests.get(url, headers=headers, cookies=cookies_dict,
                             stream=True, timeout=60) as r:
                 r.raise_for_status()
-                
+
                 # Проверяем content-type
                 content_type = r.headers.get('content-type', '')
                 if 'audio' not in content_type and 'octet-stream' not in content_type:
@@ -1648,7 +1619,7 @@ class VKMusicSearchApp:
 
             # Создаём временный файл
             fd, cookies_path = tempfile.mkstemp(suffix='.txt', prefix='vk_cookies_')
-            
+
             with os.fdopen(fd, 'w') as f:
                 # Заголовок Netscape cookies
                 f.write("# Netscape HTTP Cookie File\n")
@@ -1660,7 +1631,7 @@ class VKMusicSearchApp:
                     # Netscape формат требует точку в начале для поддоменов
                     if not domain.startswith('.'):
                         domain = '.' + domain
-                    
+
                     flag = "TRUE" if domain.startswith('.') else "FALSE"
                     path = cookie.get('path', '/')
                     secure = "TRUE" if cookie.get('secure', False) else "FALSE"
@@ -1692,46 +1663,39 @@ class VKMusicSearchApp:
     # --------------------------------------------------
 
     def _init_tree_sorting(self):
-        if not self.tree:
+        self._tree_sort_reverse = {i: False for i in range(6)}
+        header = self.tree.horizontalHeader()
+        header.sectionClicked.connect(self._sort_tree_by_column)
+
+    def _sort_tree_by_column(self, col):
+        if col >= 4:  # hidden columns
             return
-
-        self._tree_sort_reverse = {col: False for col in self.tree["columns"]}
-
-        for col in self.tree["columns"]:
-            if col == "url":  # скрытый столбец не сортируем
-                continue
-            heading_text = self.tree.heading(col, "text")
-
-            def _make_sort(colname, text=heading_text):
-                return lambda: self._sort_tree_by_column(colname)
-
-            self.tree.heading(col, text=heading_text, command=_make_sort(col))
-
-    def _sort_tree_by_column(self, col: str):
-        if not self.tree:
-            return
-
-        data = [(self.tree.set(item, col), item) for item in self.tree.get_children("")]
-
-        if col == "duration":
-            def key_func(v: str):
+        reverse = self._tree_sort_reverse.get(col, False)
+        rows = self.tree.rowCount()
+        data = []
+        for r in range(rows):
+            item = self.tree.item(r, col)
+            val = item.text() if item else ""
+            row_data = [self.tree.item(r, c).text() if self.tree.item(r, c) else "" for c in range(6)]
+            data.append((val, row_data))
+        if col == 2:  # duration
+            def key(x):
                 try:
-                    parts = v.split(":")
-                    if len(parts) == 2:
-                        return int(parts[0]) * 60 + int(parts[1])
-                    return int(v)
-                except Exception:
+                    parts = x[0].split(":")
+                    return int(parts[0]) * 60 + int(parts[1]) if len(parts) == 2 else int(x[0])
+                except:
                     return 0
         else:
-            def key_func(v: str):
-                return (v or "").lower()
-
-        reverse = self._tree_sort_reverse.get(col, False)
-        data.sort(key=lambda x: key_func(x[0]), reverse=reverse)
-
-        for index, (_, item_id) in enumerate(data):
-            self.tree.move(item_id, "", index)
-
+            key = lambda x: x[0].lower()
+        data.sort(key=key, reverse=reverse)
+        self.tree.setRowCount(0)
+        for _, row_data in data:
+            r = self.tree.rowCount()
+            self.tree.insertRow(r)
+            for c, v in enumerate(row_data):
+                item = QTableWidgetItem(v)
+                item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                self.tree.setItem(r, c, item)
         self._tree_sort_reverse[col] = not reverse
 
     # --------------------------------------------------
@@ -1743,61 +1707,59 @@ class VKMusicSearchApp:
             return
 
         def _upd():
-            self.search_status_var.set(text)
+            if self.search_status_label:
+                self.search_status_label.setText(text)
 
-        self.search_window.after(0, _upd)
+        self._call_in_main.emit(_upd)
 
     def _show_progress_bar(self, batch_mode: bool = False):
         """Показывает прогресс-бар и скорость."""
         if self.search_window is None:
             return
-        
+
         def _do():
             if batch_mode and self.batch_progress_label:
-                self.batch_progress_label.pack(side=tk.RIGHT, padx=(10, 0))
+                self.batch_progress_label.setVisible(True)
             if self.speed_label:
-                self.speed_label.pack(side=tk.RIGHT, padx=(5, 0))
+                self.speed_label.setVisible(True)
             if self.progress_bar:
-                self.progress_bar.pack(side=tk.RIGHT, padx=(10, 0))
-        
-        self.search_window.after(0, _do)
+                self.progress_bar.setVisible(True)
+
+        self._call_in_main.emit(_do)
 
     def _hide_progress_bar(self):
         """Скрывает прогресс-бар и скорость."""
         if self.search_window is None:
             return
-        
+
         def _do():
             if self.progress_bar:
-                self.progress_bar.pack_forget()
+                self.progress_bar.setVisible(False)
+                self.progress_bar.setValue(0)
             if self.speed_label:
-                self.speed_label.pack_forget()
+                self.speed_label.setVisible(False)
+                self.speed_label.setText("")
             if self.batch_progress_label:
-                self.batch_progress_label.pack_forget()
-            if self.progress_var:
-                self.progress_var.set(0)
-            if self.speed_var:
-                self.speed_var.set("")
-            if self.batch_progress_var:
-                self.batch_progress_var.set("")
-        
-        self.search_window.after(0, _do)
+                self.batch_progress_label.setVisible(False)
+                self.batch_progress_label.setText("")
+
+        self._call_in_main.emit(_do)
 
     def _update_progress(self, percent: float, speed_text: str = "", batch_text: str | None = None):
         """Обновляет прогресс-бар, скорость и batch прогресс."""
         if self.search_window is None:
             return
-        
+
         def _do():
-            if self.progress_var:
-                self.progress_var.set(percent)
-            if self.speed_var:
-                self.speed_var.set(speed_text)
+            if self.progress_bar:
+                self.progress_bar.setValue(int(percent))
+            if self.speed_label:
+                self.speed_label.setText(speed_text)
             # batch_text обновляем только если явно передан (не None)
-            if self.batch_progress_var and batch_text is not None:
-                self.batch_progress_var.set(batch_text)
-        
-        self.search_window.after(0, _do)
+            if self.batch_progress_label and batch_text is not None:
+                self.batch_progress_label.setText(batch_text)
+
+        self._call_in_main.emit(_do)
 
     @staticmethod
     def _format_seconds(seconds: float) -> str:
@@ -1815,19 +1777,20 @@ class VKMusicSearchApp:
 
     def _start_search(self):
         if self.driver is None:
-            messagebox.showwarning(
+            QMessageBox.warning(
+                self.search_window,
                 "Нет браузера",
                 "Браузер ВК не запущен. Подожди, пока откроется и залогинься."
             )
             return
 
-        query = (self.query_var.get() or "").strip()
+        query = (self.query_edit.text() or "").strip()
         if not query:
-            messagebox.showwarning("Пустой запрос", "Введите исполнителя или название.")
+            QMessageBox.warning(self.search_window, "Пустой запрос", "Введите исполнителя или название.")
             return
 
         try:
-            count = int((self.count_var.get() or "").strip())
+            count = int((self.count_edit.text() or "").strip())
         except ValueError:
             count = 30
 
@@ -1837,11 +1800,10 @@ class VKMusicSearchApp:
         if count > 500:
             count = 500
 
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        self.tree.setRowCount(0)
 
         if self.btn_search:
-            self.btn_search.config(state=tk.DISABLED)
+            self.btn_search.setEnabled(False)
 
         # Проверяем, является ли запрос ссылкой на плейлист/альбом ВК
         playlist_url = self._parse_vk_playlist_url(query)
@@ -1871,30 +1833,30 @@ class VKMusicSearchApp:
         """
         Проверяет, является ли текст URL-ом профиля/группы ВК.
         Возвращает короткое имя или ID профиля, либо None.
-        
+
         Примеры:
           https://vk.com/durov -> durov
           vk.com/id1 -> id1
           https://vk.com/club12345 -> club12345
           https://vk.com/public12345 -> public12345
         """
-        
+
         # Убираем пробелы
         text = text.strip()
-        
+
         # Паттерн для VK URL
         # Поддерживаем: https://vk.com/xxx, http://vk.com/xxx, vk.com/xxx
         pattern = r'^(?:https?://)?(?:www\.)?vk\.com/([a-zA-Z0-9._]+)(?:\?.*)?$'
         match = re.match(pattern, text)
-        
+
         if match:
             profile_id = match.group(1)
             # Исключаем служебные страницы
-            excluded = {'audio', 'audios', 'music', 'feed', 'im', 'friends', 
+            excluded = {'audio', 'audios', 'music', 'feed', 'im', 'friends',
                        'groups', 'photos', 'video', 'docs', 'settings', 'login'}
             if profile_id.lower() not in excluded:
                 return profile_id
-        
+
         return None
 
     def _parse_vk_playlist_url(self, text: str) -> str | None:
@@ -1974,7 +1936,7 @@ class VKMusicSearchApp:
             self._set_search_status(f"Ошибка: {e}")
         finally:
             if self.btn_search:
-                self.search_window.after(0, lambda: self.btn_search.config(state=tk.NORMAL))
+                self._call_in_main.emit(lambda: self.btn_search.setEnabled(True))
 
     # Извлекает треки из нового интерфейса ВК:
     # audio_full_id берём из MobX Map (shared trackProvider, ключи совпадают с порядком строк),
@@ -2155,32 +2117,32 @@ class VKMusicSearchApp:
             log_message(f"DEBUG: открываю профиль: {profile_url}")
             self.driver.get(profile_url)
             time.sleep(2)
-            
+
             # Пытаемся получить числовой ID из страницы
             numeric_id = None
-            
+
             # Способ 1: из URL (если редирект на id123 или club123)
             current_url = self.driver.current_url
             log_message(f"DEBUG: текущий URL: {current_url}")
-            
+
             # Проверяем id пользователя
             id_match = re.search(r'vk\.com/id(\d+)', current_url)
             if id_match:
                 numeric_id = id_match.group(1)
                 log_message(f"DEBUG: найден user ID в URL: {numeric_id}")
-            
+
             # Проверяем club/public
             club_match = re.search(r'vk\.com/(club|public)(\d+)', current_url)
             if club_match:
                 numeric_id = f"-{club_match.group(2)}"  # Группы с минусом
                 log_message(f"DEBUG: найден group ID в URL: {numeric_id}")
-            
+
             # Способ 2: ищем ID в HTML странице
             if not numeric_id:
                 try:
                     # Ищем в data-атрибутах или скриптах
                     page_source = self.driver.page_source
-                    
+
                     # Ищем паттерн "oid":123456 или "owner_id":123456
                     oid_match = re.search(r'"(?:oid|owner_id)"\s*:\s*(-?\d+)', page_source)
                     if oid_match:
@@ -2188,19 +2150,19 @@ class VKMusicSearchApp:
                         log_message(f"DEBUG: найден ID в HTML: {numeric_id}")
                 except Exception as e:
                     log_message(f"WARNING: ошибка при поиске ID в HTML: {e}")
-            
+
             # Способ 3: пробуем перейти напрямую на страницу аудио с коротким именем
             if not numeric_id:
                 log_message(f"DEBUG: ID не найден, пробуем audios с коротким именем")
                 numeric_id = profile_id
-            
+
             # Формируем URL страницы аудио
             audio_url = f"https://vk.com/audios{numeric_id}"
             log_message(f"DEBUG: открываю аудио: {audio_url}")
             self._set_search_status(f"Открываю аудиозаписи...")
-            
+
             self.driver.get(audio_url)
-            
+
             # Ждём загрузки аудио
             try:
                 WebDriverWait(self.driver, 10).until(
@@ -2211,22 +2173,22 @@ class VKMusicSearchApp:
                 # Возможно, аудио скрыты или их нет
                 self._set_search_status("Аудиозаписи недоступны или скрыты")
                 if self.btn_search:
-                    self.search_window.after(0, lambda: self.btn_search.config(state=tk.NORMAL))
+                    self._call_in_main.emit(lambda: self.btn_search.setEnabled(True))
                 return
-            
+
             # Скроллим и собираем треки (используем существующий метод)
             self._set_search_status("Загружаю треки...")
             results = self._scroll_and_parse_audio(count)
-            
+
             # Отображаем результаты
             self._update_results(results)
-            
+
         except Exception as e:
             log_message(f"ERROR _load_profile_music_worker: {e}")
             self._set_search_status(f"Ошибка: {e}")
         finally:
             if self.btn_search:
-                self.search_window.after(0, lambda: self.btn_search.config(state=tk.NORMAL))
+                self._call_in_main.emit(lambda: self.btn_search.setEnabled(True))
 
     def _scroll_and_parse_audio(self, count: int) -> list:
         """
@@ -2234,30 +2196,30 @@ class VKMusicSearchApp:
         Используется для загрузки музыки с профиля/группы.
         """
         limit = count if count > 0 else None
-        
+
         # Первичный парсинг
         html = self.driver.page_source
         results = self._parse_search_results(html, limit)
         log_message(f"INFO: после первой загрузки треков: {len(results)}")
-        
+
         need_more = True if limit is None else (len(results) < limit)
-        
+
         if need_more:
             scroll_pause = 1.5
             max_scrolls = 20  # Больше скроллов для профилей с большой библиотекой
-            
+
             try:
                 last_height = self.driver.execute_script("return document.body.scrollHeight")
             except Exception as e:
                 log_message(f"WARNING: не удалось получить scrollHeight: {e}")
                 last_height = None
-            
+
             for i in range(max_scrolls):
                 self._set_search_status(
                     f"Загружаю треки... ({len(results)}/{limit if limit is not None else '∞'})"
                 )
                 log_message(f"DEBUG: скролл #{i + 1}")
-                
+
                 try:
                     self.driver.execute_script(
                         "window.scrollTo(0, document.body.scrollHeight);"
@@ -2265,29 +2227,29 @@ class VKMusicSearchApp:
                 except Exception as e:
                     log_message(f"WARNING: ошибка при scrollTo: {e}")
                     break
-                
+
                 time.sleep(scroll_pause)
-                
+
                 html = self.driver.page_source
                 results = self._parse_search_results(html, limit)
                 log_message(f"INFO: после скролла #{i + 1} треков: {len(results)}")
-                
+
                 if limit is not None and len(results) >= limit:
                     log_message("INFO: набрали запрошенное количество, прекращаю скролл")
                     break
-                
+
                 try:
                     new_height = self.driver.execute_script("return document.body.scrollHeight")
                 except Exception as e:
                     log_message(f"WARNING: не удалось получить новый scrollHeight: {e}")
                     break
-                
+
                 if last_height is not None and new_height == last_height:
                     log_message("INFO: высота страницы больше не растёт, прекращаю скролл")
                     break
-                
+
                 last_height = new_height
-        
+
         return results
 
     def _search_worker(self, query: str, count: int):
@@ -2442,9 +2404,7 @@ class VKMusicSearchApp:
 
         finally:
             if self.btn_search and self.search_window is not None:
-                self.search_window.after(
-                    0, lambda: self.btn_search.config(state=tk.NORMAL)
-                )
+                self._call_in_main.emit(lambda: self.btn_search.setEnabled(True))
 
     # --------------------------------------------------
     # ПАРСИНГ data-audio
@@ -2469,7 +2429,7 @@ class VKMusicSearchApp:
         for row in rows:
             try:
 
-                                # --- НОВАЯ ПРОВЕРКА НА НЕДОСТУПНОСТЬ ---
+                               # --- НОВАЯ ПРОВЕРКА НА НЕДОСТУПНОСТЬ ---
                 # Проверяем, есть ли у ряда или его дочерних элементов признак недоступности
                 # Примеры классов, которые могут указывать на недоступность (нужно проверить на практике)
                 unavailable_indicators = [
@@ -2494,7 +2454,7 @@ class VKMusicSearchApp:
                 if is_unavailable:
                     log_message(f"DEBUG: пропущен недоступный трек по классу/атрибуту")
                     continue
-                # --- КОНЕЦ НОВОЙ ПРОВЕРКИ ---    
+                # --- КОНЕЦ НОВОЙ ПРОВЕРКИ ---
 
                 data_attr = row.get("data-audio")
                 if not data_attr:
@@ -2586,7 +2546,7 @@ class VKMusicSearchApp:
             return
 
         def _do():
-            self.tree.delete(*self.tree.get_children())
+            self.tree.setRowCount(0)
             for row in results:
                 if len(row) >= 6:
                     artist, title, duration, owner, url, audio_full_id = row[:6]
@@ -2604,14 +2564,20 @@ class VKMusicSearchApp:
                     audio_full_id = ""
                 else:
                     continue
-                self.tree.insert("", tk.END, values=(artist, title, duration, owner, url, audio_full_id))
+                r = self.tree.rowCount()
+                self.tree.insertRow(r)
+                for col, val in enumerate([artist, title, duration, owner, url, audio_full_id]):
+                    item = QTableWidgetItem(str(val or ""))
+                    item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                    self.tree.setItem(r, col, item)
 
-            if results:
-                self.search_status_var.set(f"Найдено треков: {len(results)}")
+            count = self.tree.rowCount()
+            if count:
+                self.search_status_label.setText(f"Найдено треков: {count}")
             else:
-                self.search_status_var.set("Ничего не найдено")
+                self.search_status_label.setText("Ничего не найдено")
 
-        self.search_window.after(0, _do)
+        self._call_in_main.emit(_do)
 
     # --------------------------------------------------
     # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
@@ -2619,37 +2585,37 @@ class VKMusicSearchApp:
 
     def _show_error_async(self, text: str):
         def _do():
-            messagebox.showerror("Ошибка", text)
-        self.root.after(0, _do)
+            QMessageBox.critical(self.search_window, "Ошибка", text)
+        self._call_in_main.emit(_do)
 
     def _show_info_async(self, text: str):
         def _do():
-            messagebox.showinfo("Информация", text)
-        self.root.after(0, _do)
+            QMessageBox.information(self.search_window, "Информация", text)
+        self._call_in_main.emit(_do)
 
 
 # ------------------------------------------------------
 # ВНЕШНЯЯ ФУНКЦИЯ ДЛЯ ИНТЕГРАЦИИ
 # ------------------------------------------------------
-def search_vk_music(root, auto_open=True):
+def search_vk_music(root=None, auto_open=True):
     """
     Использование из основной программы:
         from vk_search import search_vk_music
         ...
-        search_vk_music(root)
+        search_vk_music()
     """
     global _app_instance
     try:
         if _app_instance is not None and _app_instance.search_window is not None:
-            _app_instance.search_window.lift()
-            _app_instance.search_window.focus_force()
+            _app_instance.search_window.raise_()
+            _app_instance.search_window.activateWindow()
             return
 
         log_message("INFO: запуск VKMusicSearchApp из search_vk_music")
-        _app_instance = VKMusicSearchApp(root, auto_open_browser=auto_open)
+        _app_instance = VKMusicSearchApp(auto_open_browser=auto_open)
     except Exception as e:
         log_message(f"ERROR в search_vk_music: {e}")
-        messagebox.showerror("Ошибка", f"Ошибка при запуске поиска ВК: {e}")
+        QMessageBox.critical(None, "Ошибка", f"Ошибка при запуске поиска ВК: {e}")
 
 
 # ------------------------------------------------------
@@ -2657,7 +2623,6 @@ def search_vk_music(root, auto_open=True):
 # ------------------------------------------------------
 if __name__ == "__main__":
     _standalone_mode = True
-    root = tk.Tk()
-    root.withdraw()
-    search_vk_music(root, auto_open=True)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    _instance = VKMusicSearchApp(auto_open_browser=True)
+    sys.exit(app.exec_())
