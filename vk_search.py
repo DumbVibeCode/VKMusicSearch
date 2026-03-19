@@ -1962,6 +1962,9 @@ class VKMusicSearchApp:
                     self._set_search_status("Треки не найдены. Возможно, плейлист приватный или страница не загрузилась.")
                     return
 
+            # Нажимаем "Показать все" / "Показать всё", если кнопка есть
+            self._click_show_all_button()
+
             self._set_search_status("Загружаю треки...")
             results = self._scroll_and_extract_playlist(count)
             self._update_results(results)
@@ -2056,6 +2059,35 @@ class VKMusicSearchApp:
                 full_id,
             ))
         return results
+
+    def _click_show_all_button(self):
+        """Нажимает кнопку 'Показать все/всё' на странице плейлиста, если она есть."""
+        try:
+            clicked = self.driver.execute_script("""
+                var texts = ['Показать все', 'Показать всё', 'Show all', 'show all'];
+                // Ищем по тексту среди кнопок и ссылок
+                var candidates = Array.from(
+                    document.querySelectorAll('button, a, span, div[role="button"]')
+                );
+                for (var i = 0; i < candidates.length; i++) {
+                    var el = candidates[i];
+                    var t = (el.innerText || el.textContent || '').trim();
+                    for (var j = 0; j < texts.length; j++) {
+                        if (t === texts[j] || t.startsWith(texts[j])) {
+                            el.click();
+                            return t;
+                        }
+                    }
+                }
+                return null;
+            """)
+            if clicked:
+                log_message(f"INFO: нажата кнопка '{clicked}', ждём загрузки всех треков...")
+                time.sleep(2)
+            else:
+                log_message("INFO: кнопка 'Показать все' не найдена")
+        except Exception as e:
+            log_message(f"WARNING: _click_show_all_button: {e}")
 
     def _scroll_and_extract_playlist(self, count: int) -> list[tuple]:
         """
