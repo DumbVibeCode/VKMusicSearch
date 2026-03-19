@@ -964,6 +964,61 @@ class VKMusicSearchApp:
                 log_message(f"DOWNLOAD: не найден элемент трека {audio_full_id}")
                 return None
 
+            # Инъектируем перехватчик XHR/fetch/audio ДО клика
+            try:
+                self.driver.execute_script("""
+                    window.__vk_al_audio_response = null;
+                    window.__vk_audio_stream_url = null;
+
+                    // Сохранить URL аудиопотока (только реальные HTTP-ссылки на аудио)
+                    function _vkCaptureStream(u) {
+                        if (!window.__vk_audio_stream_url && u &&
+                            !u.startsWith('data:') && !u.startsWith('blob:') &&
+                            (u.indexOf('vkuseraudio') !== -1 || u.indexOf('.m3u8') !== -1)) {
+                            window.__vk_audio_stream_url = u;
+                        }
+                    }
+
+                    if (!window.__vk_xhr_patched) {
+                        window.__vk_xhr_patched = true;
+                        var _origOpen = XMLHttpRequest.prototype.open;
+                        var _origSend = XMLHttpRequest.prototype.send;
+                        XMLHttpRequest.prototype.open = function(method, url) {
+                            this._vkUrl = url || '';
+                            return _origOpen.apply(this, arguments);
+                        };
+                        XMLHttpRequest.prototype.send = function() {
+                            var xhr = this;
+                            _vkCaptureStream(xhr._vkUrl);
+                            this.addEventListener('load', function() {
+                                if (xhr._vkUrl.indexOf('al_audio.php') !== -1) {
+                                    window.__vk_al_audio_response = xhr.responseText;
+                                }
+                                _vkCaptureStream(xhr._vkUrl);
+                            });
+                            return _origSend.apply(this, arguments);
+                        };
+                    }
+                    if (!window.__vk_fetch_patched) {
+                        window.__vk_fetch_patched = true;
+                        var _origFetch = window.fetch;
+                        window.fetch = function(input, init) {
+                            var url = typeof input === 'string' ? input : (input ? input.url : '');
+                            _vkCaptureStream(url);
+                            return _origFetch.apply(window, arguments).then(function(resp) {
+                                if (url && url.indexOf('al_audio.php') !== -1) {
+                                    resp.clone().text().then(function(t) {
+                                        window.__vk_al_audio_response = t;
+                                    }).catch(function(){});
+                                }
+                                return resp;
+                            });
+                        };
+                    }
+                """)
+            except Exception:
+                pass
+
             # Кликаем на кнопку воспроизведения
             if use_new_interface:
                 try:
@@ -984,150 +1039,170 @@ class VKMusicSearchApp:
 
             log_message("DOWNLOAD: кликнули на трек, ждём загрузки URL...")
 
-            # Быстрое ожидание URL - проверяем каждые 0.3 сек, максимум 2 сек
+            # Ждём URL: stream_url (приоритет), JS globals, ответ al_audio.php
             audio_url = None
-            for _ in range(7):  # 7 * 0.3 = 2.1 сек максимум
+            stream_url = None
+            al_response = None
+            for i in range(20):  # 20 * 0.3 = 6 сек максимум
                 time.sleep(0.3)
-                
-                # Получаем URL через JavaScript - проверяем разные места
-                audio_url = self.driver.execute_script("""
-                    // Способ 1: глобальный плеер VK (новый)
-                    try {
-                        if (window.ap && window.ap._impl) {
-                            var impl = window.ap._impl;
-                            if (impl._currentAudio && impl._currentAudio.url) {
-                                return impl._currentAudio.url;
+
+                # Приоритет 1: реальный URL аудиопотока (уже расшифрованный VK'ом)
+                if not stream_url:
+                    stream_url = self.driver.execute_script(
+                        "return window.__vk_audio_stream_url;"
+                    )
+
+                # Приоритет 2: ответ al_audio.php (нужно декодировать)
+                if not al_response:
+                    al_response = self.driver.execute_script(
+                        "return window.__vk_al_audio_response;"
+                    )
+
+                # Приоритет 3: JS globals (window.ap, HTML5 audio)
+                if not audio_url:
+                    audio_url = self.driver.execute_script("""
+                        try {
+                            if (window.ap && window.ap._impl) {
+                                var impl = window.ap._impl;
+                                if (impl._currentAudio && impl._currentAudio.url) return impl._currentAudio.url;
+                                if (impl.currentAudio && impl.currentAudio.url) return impl.currentAudio.url;
                             }
-                            if (impl.currentAudio && impl.currentAudio.url) {
-                                return impl.currentAudio.url;
-                            }
-                        }
-                    } catch(e) {}
-                    
-                    // Способ 2: getAudioPlayer()
-                    try {
-                        if (typeof getAudioPlayer === 'function') {
-                            var player = getAudioPlayer();
-                            if (player) {
-                                if (player._impl && player._impl._currentAudio) {
-                                    return player._impl._currentAudio.url;
-                                }
-                                if (player.getCurrentAudio) {
-                                    var audio = player.getCurrentAudio();
-                                    if (audio && audio.url) return audio.url;
-                                }
-                            }
-                        }
-                    } catch(e) {}
-                    
-                    // Способ 3: HTML5 audio элемент
-                    try {
-                        var audioEl = document.querySelector('audio');
-                        if (audioEl && audioEl.src && audioEl.src.length > 10) {
-                            return audioEl.src;
-                        }
-                    } catch(e) {}
-                    
-                    // Способ 4: через AudioPlayer глобальный объект
-                    try {
-                        if (window.AudioPlayer && window.AudioPlayer.prototype) {
-                            var instances = Object.values(window).filter(function(v) {
-                                return v && v.constructor && v.constructor.name === 'AudioPlayer';
-                            });
-                            for (var i = 0; i < instances.length; i++) {
-                                if (instances[i]._currentAudio && instances[i]._currentAudio.url) {
-                                    return instances[i]._currentAudio.url;
+                        } catch(e) {}
+                        try {
+                            if (typeof getAudioPlayer === 'function') {
+                                var p = getAudioPlayer();
+                                if (p) {
+                                    if (p._impl && p._impl._currentAudio) return p._impl._currentAudio.url;
+                                    if (p.getCurrentAudio) { var a = p.getCurrentAudio(); if (a && a.url) return a.url; }
                                 }
                             }
-                        }
-                    } catch(e) {}
-                    
-                    // Способ 5: через cur.audioPlayer
-                    try {
-                        if (window.cur && window.cur.audioPlayer) {
-                            var ap = window.cur.audioPlayer;
-                            if (ap._impl && ap._impl._currentAudio) {
-                                return ap._impl._currentAudio.url;
-                            }
-                        }
-                    } catch(e) {}
-                    
-                    return null;
-                """)
-                
-                if audio_url:
-                    log_message(f"DOWNLOAD: URL получен за {(_ + 1) * 0.3:.1f} сек")
+                        } catch(e) {}
+                        try {
+                            var audioEl = document.querySelector('audio');
+                            if (audioEl && audioEl.src && audioEl.src.length > 10) return audioEl.src;
+                        } catch(e) {}
+                        return null;
+                    """)
+
+                # Прерываем только если нашли реальный URL (stream_url / audio_url)
+                # al_response мало — VK ещё не успел расшифровать URL и сделать запрос на поток
+                if stream_url or audio_url:
+                    log_message(f"DOWNLOAD: stream/player URL получен за {(i + 1) * 0.3:.1f} сек")
                     break
+                if al_response and not stream_url and i == 19:
+                    log_message("DOWNLOAD: stream URL не появился за 6 сек, используем al_response")
 
             # Останавливаем воспроизведение
             try:
                 self.driver.execute_script("""
-                    try {
-                        if (window.ap && window.ap.pause) window.ap.pause();
-                        if (typeof getAudioPlayer === 'function') {
-                            var p = getAudioPlayer();
-                            if (p && p.pause) p.pause();
-                        }
-                        var audio = document.querySelector('audio');
-                        if (audio) audio.pause();
-                    } catch(e) {}
+                    try { if (window.ap && window.ap.pause) window.ap.pause(); } catch(e) {}
+                    try { var audio = document.querySelector('audio'); if (audio) audio.pause(); } catch(e) {}
                 """)
             except Exception:
                 pass
 
+            # Способ 1: прямой URL аудиопотока (VK уже расшифровал)
+            if stream_url:
+                log_message(f"DOWNLOAD: stream URL перехвачен: {stream_url[:120]}")
+                return stream_url
+
+            # Способ 2: URL из JS globals (window.ap / HTML5 audio)
             if audio_url:
-                log_message(f"DOWNLOAD: получен URL из JS: {audio_url[:80]}...")
+                log_message(f"DOWNLOAD: URL из JS globals: {audio_url[:80]}...")
                 return audio_url
 
-            # Альтернатива: смотрим в Performance log
-            try:
-                logs = self.driver.get_log('performance')
-                log_message(f"DOWNLOAD: получено {len(logs)} записей в performance log")
-                
-                m3u8_url = None
-                fallback_url = None
-                
-                for entry in reversed(logs):  # Сначала новые
-                    try:
-                        msg = json.loads(entry['message'])
-                        message_data = msg.get('message', {})
-                        if message_data.get('method') == 'Network.requestWillBeSent':
-                            url = message_data.get('params', {}).get('request', {}).get('url', '')
-                            
-                            # Приоритет 1: index.m3u8
-                            if 'index.m3u8' in url:
-                                log_message(f"DOWNLOAD: найден m3u8 URL: {url}")
-                                m3u8_url = url
-                                break
-                            
-                            # Приоритет 2: любой vkuseraudio URL (может быть сегмент)
-                            if 'vkuseraudio' in url and not fallback_url:
-                                fallback_url = url
-                                log_message(f"DOWNLOAD: найден fallback URL: {url}")
-                                
-                    except Exception:
-                        continue
-                
-                # Возвращаем лучший найденный URL
-                if m3u8_url:
-                    return m3u8_url
-                if fallback_url:
-                    # Пробуем преобразовать URL сегмента в index.m3u8
-                    # URL сегмента: .../seg-1-a1.ts -> .../index.m3u8
-                    if '/seg-' in fallback_url:
-                        m3u8_url = fallback_url.rsplit('/seg-', 1)[0] + '/index.m3u8'
-                        log_message(f"DOWNLOAD: преобразован в m3u8: {m3u8_url}")
-                        return m3u8_url
-                    return fallback_url
-                    
-            except Exception as e:
-                log_message(f"WARNING: не удалось получить performance logs: {e}")
+            # Способ 2: URL из тела ответа al_audio.php
+            if al_response:
+                log_message(f"DOWNLOAD: ответ al_audio.php ({len(al_response)} байт): {al_response[:300]}")
+                import re as _re
+                # Убираем JSON-экранирование \/ → / перед поиском
+                al_clean = al_response.replace('\\/', '/')
+                for pat in [
+                    r'https?://[^\s"\',\[\]{}]+index\.m3u8',
+                    r'https?://vkuseraudio\.net[^\s"\',\[\]{}]+',
+                    r'https?://[^\s"\',\[\]{}]+\.m3u8',
+                    r'https?://[^\s"\',\[\]{}]+audio_api_unavailable\.mp3\?extra=[^\s"\',\[\]{}]+',
+                    r'https?://[^\s"\',\[\]{}]+\.mp3',
+                ]:
+                    m = _re.search(pat, al_clean)
+                    if m:
+                        url_found = m.group(0)
+                        if 'audio_api_unavailable' in url_found:
+                            url_decoded = self._decode_vk_audio_url(url_found)
+                            if url_decoded != url_found:
+                                log_message(f"DOWNLOAD: декодирован URL: {url_decoded[:120]}")
+                                return url_decoded
+                            log_message(f"DOWNLOAD: decode не удался, пробуем другие паттерны")
+                            continue
+                        log_message(f"DOWNLOAD: URL из al_audio.php: {url_found[:80]}")
+                        return url_found
+                log_message("DOWNLOAD: URL не найден в ответе al_audio.php (неизвестный формат)")
 
+            log_message("DOWNLOAD intercept: не удалось получить URL")
             return None
 
         except Exception as e:
             log_message(f"ERROR _get_audio_url_via_click: {e}")
             return None
+
+    @staticmethod
+    def _decode_vk_audio_url(url: str) -> str:
+        """Декодирует audio_api_unavailable.mp3?extra=... VK obfuscated audio URL.
+
+        Алгоритм: base64url-декодирует параметр extra, получает строку вида
+        real_url[TAB op1 TAB op2 ...], применяет операции i(pos,code), s(a,b), r.
+        """
+        import base64
+        import re as _re
+
+        if not url or 'audio_api_unavailable' not in url:
+            return url
+
+        try:
+            parts_extra = url.split('?extra=')
+            if len(parts_extra) < 2:
+                return url
+            extra = parts_extra[1].split('#')[0]
+
+            def b64_decode(s):
+                s = s.replace('-', '+').replace('_', '/')
+                s += '=' * (-len(s) % 4)
+                return base64.b64decode(s).decode('utf-8', errors='replace')
+
+            decoded = b64_decode(extra)
+            log_message(f"DECODE: extra→ {repr(decoded[:120])}")
+
+            parts = decoded.split('\t')
+            real_url = parts[0]
+
+            for op in parts[1:]:
+                if not op:
+                    continue
+                m = _re.match(r'^i\((\d+),(\d+)\)$', op)
+                if m:
+                    pos, code = int(m.group(1)), int(m.group(2))
+                    if 0 <= pos <= len(real_url):
+                        real_url = real_url[:pos] + chr(code) + real_url[pos:]
+                    continue
+                m = _re.match(r'^s\((\d+),(\d+)\)$', op)
+                if m:
+                    a, b = int(m.group(1)), int(m.group(2))
+                    if 0 <= a < len(real_url) and 0 <= b < len(real_url):
+                        lst = list(real_url)
+                        lst[a], lst[b] = lst[b], lst[a]
+                        real_url = ''.join(lst)
+                    continue
+                if op == 'r':
+                    real_url = real_url[::-1]
+
+            if real_url.startswith('http'):
+                return real_url
+
+            log_message(f"DECODE: первая часть не URL: {repr(real_url[:80])}")
+        except Exception as e:
+            log_message(f"DECODE error: {e}")
+
+        return url
 
     def _download_m3u8_via_ytdlp(self, url: str, path: str) -> bool:
         """Скачивает аудио URL через yt-dlp (subprocess) или requests."""
