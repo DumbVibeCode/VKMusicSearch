@@ -83,6 +83,15 @@ _standalone_mode = False
 # ------------------------------------------------------
 # Вспомогательный класс окна поиска
 # ------------------------------------------------------
+class _NoEnterButton(QPushButton):
+    """QPushButton, который не реагирует на Enter/Return (не триггерит click)."""
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            event.ignore()
+            return
+        super().keyPressEvent(event)
+
+
 class _SearchWindow(QWidget):
     def __init__(self, on_close):
         super().__init__()
@@ -306,7 +315,7 @@ class VKMusicSearchApp(QObject):
         self.btn_search.clicked.connect(self._start_search)
         search_hlayout.addWidget(self.btn_search)
 
-        self.btn_download = QPushButton("⬇ Скачать выбранные")
+        self.btn_download = _NoEnterButton("⬇ Скачать выбранные")
         self.btn_download.clicked.connect(self._download_selected_tracks)
         search_hlayout.addWidget(self.btn_download)
 
@@ -2331,71 +2340,10 @@ class VKMusicSearchApp(QObject):
                     "Работаю с основной страницей поиска (recoms_block не найден)."
                 )
 
-            html = self.driver.page_source
-            limit = count if count > 0 else None
-            results = self._parse_search_results(html, limit)
-            log_message(f"INFO: после первой загрузки треков: {len(results)}")
-
-            need_more = True if limit is None else (len(results) < limit)
-
-            if need_more:
-                scroll_pause = 1.5
-                max_scrolls = 15
-
-                try:
-                    last_height = self.driver.execute_script("return document.body.scrollHeight")
-                except Exception as e:
-                    log_message(f"WARNING: не удалось получить scrollHeight: {e}")
-                    last_height = None
-
-                for i in range(max_scrolls):
-                    self._set_search_status(
-                        f"Догружаю результаты... "
-                        f"({len(results)}/{limit if limit is not None else '∞'})"
-                    )
-                    log_message(f"DEBUG: скролл #{i + 1}")
-
-                    try:
-                        self.driver.execute_script(
-                            "window.scrollTo(0, document.body.scrollHeight);"
-                        )
-                    except Exception as e:
-                        log_message(f"WARNING: ошибка при scrollTo: {e}")
-                        break
-
-                    time.sleep(scroll_pause)
-
-                    html = self.driver.page_source
-                    results = self._parse_search_results(html, limit)
-                    log_message(
-                        f"INFO: после скролла #{i + 1} треков: {len(results)}"
-                    )
-
-                    if limit is not None and len(results) >= limit:
-                        log_message(
-                            "INFO: набрали запрошенное количество треков, "
-                            "прекращаю скролл"
-                        )
-                        break
-
-                    try:
-                        new_height = self.driver.execute_script(
-                            "return document.body.scrollHeight"
-                        )
-                    except Exception as e:
-                        log_message(
-                            f"WARNING: не удалось получить новый scrollHeight: {e}"
-                        )
-                        break
-
-                    if last_height is not None and new_height == last_height:
-                        log_message(
-                            "INFO: высота страницы больше не растёт, прекращаю скролл"
-                        )
-                        break
-
-                    last_height = new_height
-
+            # Используем тот же метод, что работает для плейлистов/профилей:
+            # сначала пробуем JS (новый интерфейс ВК), потом BeautifulSoup (старый)
+            results = self._scroll_and_extract_playlist(count)
+            log_message(f"INFO: итого треков после поиска: {len(results)}")
             self._update_results(results)
 
         except Exception as e:
